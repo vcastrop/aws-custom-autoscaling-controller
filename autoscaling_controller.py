@@ -7,22 +7,17 @@ from datetime import datetime, timedelta, timezone
 
 REGION = "us-east-1"
 
-# Capacity limits required by the challenge
 MIN_INSTANCES = 1
 MAX_INSTANCES = 5
 
 # Initial thresholds.
-# These will be validated and adjusted during the experiments.
+# They will be validated during the experiments.
 SCALE_OUT_THRESHOLD = 60.0
 SCALE_IN_THRESHOLD = 20.0
 
-# For now, only these instances are managed by the controller.
-# Later we will replace this with project tags so dynamically
-# created instances are automatically detected.
-INSTANCE_NAMES = [
-    "autoscaling-web-base",
-    "autoscaling-web-test-2"
-]
+# Tags used to identify ONLY instances managed by this project.
+PROJECT_TAG = "CustomAutoScaling"
+MANAGED_BY_TAG = "CustomController"
 
 
 # ============================================================
@@ -39,8 +34,10 @@ cloudwatch = boto3.client("cloudwatch", region_name=REGION)
 
 def get_running_instances():
     """
-    Returns the running EC2 instances currently managed
-    by the controller.
+    Returns running EC2 instances belonging to this project.
+
+    Instances are discovered dynamically using tags instead
+    of hard-coded instance names.
     """
 
     response = ec2.describe_instances(
@@ -50,8 +47,12 @@ def get_running_instances():
                 "Values": ["running"]
             },
             {
-                "Name": "tag:Name",
-                "Values": INSTANCE_NAMES
+                "Name": "tag:Project",
+                "Values": [PROJECT_TAG]
+            },
+            {
+                "Name": "tag:ManagedBy",
+                "Values": [MANAGED_BY_TAG]
             }
         ]
     )
@@ -61,7 +62,6 @@ def get_running_instances():
     for reservation in response["Reservations"]:
         for instance in reservation["Instances"]:
 
-            # Get Name tag
             instance_name = "N/A"
 
             for tag in instance.get("Tags", []):
@@ -125,9 +125,7 @@ def get_cpu(instance_id):
 
 def calculate_fleet_cpu(cpu_values):
     """
-    Calculates the average CPU utilization of the fleet.
-
-    Returns None when no valid CloudWatch metrics are available.
+    Calculates average CPU utilization across the fleet.
     """
 
     if not cpu_values:
@@ -142,24 +140,18 @@ def calculate_fleet_cpu(cpu_values):
 
 def decide_capacity(instance_count, fleet_cpu):
     """
-    Determines whether capacity should increase, decrease,
-    or remain unchanged.
+    Returns one of the three controller decisions.
 
-    This function ONLY returns a decision.
-    It does not modify AWS resources.
+    No AWS resources are modified here.
     """
 
-    # Safe behavior if CloudWatch does not return metrics
     if fleet_cpu is None:
         return (
             "MAINTAIN_CAPACITY",
             "No CPU metrics available. Safe fallback."
         )
 
-    # ----------------------------
     # SCALE OUT
-    # ----------------------------
-
     if fleet_cpu >= SCALE_OUT_THRESHOLD:
 
         if instance_count >= MAX_INSTANCES:
@@ -175,10 +167,7 @@ def decide_capacity(instance_count, fleet_cpu):
             f"{SCALE_OUT_THRESHOLD:.2f}%."
         )
 
-    # ----------------------------
     # SCALE IN
-    # ----------------------------
-
     if fleet_cpu <= SCALE_IN_THRESHOLD:
 
         if instance_count <= MIN_INSTANCES:
@@ -194,10 +183,7 @@ def decide_capacity(instance_count, fleet_cpu):
             f"{SCALE_IN_THRESHOLD:.2f}%."
         )
 
-    # ----------------------------
     # MAINTAIN
-    # ----------------------------
-
     return (
         "MAINTAIN_CAPACITY",
         f"Fleet CPU {fleet_cpu:.2f}% is inside the "
@@ -232,6 +218,12 @@ def main():
 
     instances = get_running_instances()
     instance_count = len(instances)
+
+    print(
+        f"Discovery tags: "
+        f"Project={PROJECT_TAG}, "
+        f"ManagedBy={MANAGED_BY_TAG}"
+    )
 
     print(f"Running instances: {instance_count}")
     print(
@@ -324,7 +316,7 @@ def main():
     elif decision == "REDUCE_CAPACITY":
         print(
             "Simulated action: "
-            "Remove one EC2 instance."
+            "Remove one managed EC2 instance."
         )
 
     else:
