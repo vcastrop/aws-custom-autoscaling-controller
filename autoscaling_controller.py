@@ -10,14 +10,23 @@ REGION = "us-east-1"
 MIN_INSTANCES = 1
 MAX_INSTANCES = 5
 
-# Initial thresholds.
-# They will be validated during the experiments.
-SCALE_OUT_THRESHOLD = 60.0
-SCALE_IN_THRESHOLD = 20.0
+# Initial thresholds - will be validated experimentally
+SCALE_OUT_CPU_THRESHOLD = 60.0
+SCALE_IN_CPU_THRESHOLD = 20.0
 
-# Tags used to identify ONLY instances managed by this project.
+# Detect individual overloaded instances
+HIGH_INSTANCE_CPU_THRESHOLD = 80.0
+
+# ALB request thresholds per 5-minute period.
+# Initial experimental values; not final.
+SCALE_OUT_REQUEST_THRESHOLD = 1000
+SCALE_IN_REQUEST_THRESHOLD = 100
+
 PROJECT_TAG = "CustomAutoScaling"
 MANAGED_BY_TAG = "CustomController"
+
+# CloudWatch LoadBalancer dimension extracted from the ALB ARN
+ALB_DIMENSION = "app/autoscaling-web-alb/b93f8a5f93d870ab"
 
 
 # ============================================================
@@ -29,15 +38,13 @@ cloudwatch = boto3.client("cloudwatch", region_name=REGION)
 
 
 # ============================================================
-# OBSERVE
+# OBSERVE - EC2
 # ============================================================
 
 def get_running_instances():
     """
-    Returns running EC2 instances belonging to this project.
-
-    Instances are discovered dynamically using tags instead
-    of hard-coded instance names.
+    Returns running EC2 instances managed by this controller.
+    Discovery is based on project tags.
     """
 
     response = ec2.describe_instances(
@@ -62,20 +69,22 @@ def get_running_instances():
     for reservation in response["Reservations"]:
         for instance in reservation["Instances"]:
 
-            instance_name = "N/A"
-
-            for tag in instance.get("Tags", []):
-                if tag["Key"] == "Name":
-                    instance_name = tag["Value"]
-                    break
+            tags = {
+                tag["Key"]: tag["Value"]
+                for tag in instance.get("Tags", [])
+            }
 
             instances.append({
                 "id": instance["InstanceId"],
-                "name": instance_name,
+                "name": tags.get("Name", "N/A"),
                 "type": instance["InstanceType"],
                 "private_ip": instance.get(
                     "PrivateIpAddress",
                     "N/A"
+                ),
+                "protected": (
+                    tags.get("Protected", "false").lower()
+                    == "true"
                 )
             })
 
@@ -84,8 +93,8 @@ def get_running_instances():
 
 def get_cpu(instance_id):
     """
-    Gets the latest available 5-minute average CPUUtilization
-    metric for an EC2 instance from CloudWatch.
+    Gets the latest 5-minute Average CPUUtilization datapoint
+    from CloudWatch for one EC2 instance.
     """
 
     end_time = datetime.now(timezone.utc)
@@ -113,82 +122,209 @@ def get_cpu(instance_id):
 
     latest = max(
         datapoints,
-        key=lambda x: x["Timestamp"]
+        key=lambda point: point["Timestamp"]
     )
 
     return latest["Average"]
 
 
 # ============================================================
+# OBSERVE - APPLICATION LOAD BALANCER
+# ============================================================
+
+def get_request_count():
+    """
+    Gets the latest 5-minute RequestCount Sum for the ALB.
+    """
+
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(minutes=10)
+
+    response = cloudwatch.get_metric_statistics(
+        Namespace="AWS/ApplicationELB",
+        MetricName="RequestCount",
+        Dimensions=[
+            {
+                "Name": "LoadBalancer",
+                "Value": ALB_DIMENSION
+            }
+        ],
+        StartTime=start_time,
+        EndTime=end_time,
+        Period=300,
+        Statistics=["Sum"]
+    )
+
+    datapoints = response.get("Datapoints", [])
+
+    if not datapoints:
+        return None
+
+    latest = max(
+        datapoints,
+        key=lambda point: point["Timestamp"]
+    )
+
+    return latest["Sum"]
+
+
+# ============================================================
 # ANALYZE
 # ============================================================
 
-def calculate_fleet_cpu(cpu_values):
+def analyze_metrics(cpu_values, request_count):
     """
-    Calculates average CPU utilization across the fleet.
+    Calculates fleet-level metrics.
+
+    Returns:
+        fleet_cpu_avg
+        max_instance_cpu
+        request_count
     """
 
-    if not cpu_values:
-        return None
+    if cpu_values:
+        fleet_cpu_avg = sum(cpu_values) / len(cpu_values)
+        max_instance_cpu = max(cpu_values)
+    else:
+        fleet_cpu_avg = None
+        max_instance_cpu = None
 
-    return sum(cpu_values) / len(cpu_values)
+    return {
+        "fleet_cpu_avg": fleet_cpu_avg,
+        "max_instance_cpu": max_instance_cpu,
+        "request_count": request_count
+    }
 
 
 # ============================================================
 # DECIDE
 # ============================================================
 
-def decide_capacity(instance_count, fleet_cpu):
+def decide_capacity(instance_count, metrics):
     """
-    Returns one of the three controller decisions.
+    Makes a scaling decision without modifying AWS resources.
 
-    No AWS resources are modified here.
+    Decisions:
+        INCREASE_CAPACITY
+        MAINTAIN_CAPACITY
+        REDUCE_CAPACITY
     """
+
+    fleet_cpu = metrics["fleet_cpu_avg"]
+    max_cpu = metrics["max_instance_cpu"]
+    requests = metrics["request_count"]
+
+    # --------------------------------------------------------
+    # SAFE FALLBACK
+    # --------------------------------------------------------
 
     if fleet_cpu is None:
         return (
             "MAINTAIN_CAPACITY",
-            "No CPU metrics available. Safe fallback."
+            "CPU metrics unavailable. Safe fallback."
         )
 
+    # --------------------------------------------------------
     # SCALE OUT
-    if fleet_cpu >= SCALE_OUT_THRESHOLD:
+    # --------------------------------------------------------
+
+    high_average_cpu = (
+        fleet_cpu >= SCALE_OUT_CPU_THRESHOLD
+    )
+
+    high_individual_cpu = (
+        max_cpu is not None
+        and max_cpu >= HIGH_INSTANCE_CPU_THRESHOLD
+    )
+
+    high_requests = (
+        requests is not None
+        and requests >= SCALE_OUT_REQUEST_THRESHOLD
+    )
+
+    if high_average_cpu or high_individual_cpu or high_requests:
 
         if instance_count >= MAX_INSTANCES:
             return (
                 "MAINTAIN_CAPACITY",
-                f"Maximum capacity reached "
+                f"Scale-out condition detected, but maximum "
+                f"capacity is already reached "
                 f"({instance_count}/{MAX_INSTANCES})."
+            )
+
+        reasons = []
+
+        if high_average_cpu:
+            reasons.append(
+                f"fleet CPU {fleet_cpu:.2f}% >= "
+                f"{SCALE_OUT_CPU_THRESHOLD:.2f}%"
+            )
+
+        if high_individual_cpu:
+            reasons.append(
+                f"max instance CPU {max_cpu:.2f}% >= "
+                f"{HIGH_INSTANCE_CPU_THRESHOLD:.2f}%"
+            )
+
+        if high_requests:
+            reasons.append(
+                f"RequestCount {requests:.0f} >= "
+                f"{SCALE_OUT_REQUEST_THRESHOLD}"
             )
 
         return (
             "INCREASE_CAPACITY",
-            f"Fleet CPU {fleet_cpu:.2f}% >= "
-            f"{SCALE_OUT_THRESHOLD:.2f}%."
+            "Scale-out condition: " + "; ".join(reasons)
         )
 
+    # --------------------------------------------------------
     # SCALE IN
-    if fleet_cpu <= SCALE_IN_THRESHOLD:
+    # --------------------------------------------------------
+
+    low_average_cpu = (
+        fleet_cpu <= SCALE_IN_CPU_THRESHOLD
+    )
+
+    low_requests = (
+        requests is not None
+        and requests <= SCALE_IN_REQUEST_THRESHOLD
+    )
+
+    # Scale-in is intentionally more conservative.
+    # Both CPU and RequestCount must indicate low demand.
+    if low_average_cpu and low_requests:
 
         if instance_count <= MIN_INSTANCES:
             return (
                 "MAINTAIN_CAPACITY",
-                f"Minimum capacity reached "
+                f"Low demand detected, but minimum capacity "
+                f"is already reached "
                 f"({instance_count}/{MIN_INSTANCES})."
             )
 
         return (
             "REDUCE_CAPACITY",
-            f"Fleet CPU {fleet_cpu:.2f}% <= "
-            f"{SCALE_IN_THRESHOLD:.2f}%."
+            f"Low demand: fleet CPU {fleet_cpu:.2f}% <= "
+            f"{SCALE_IN_CPU_THRESHOLD:.2f}% AND "
+            f"RequestCount {requests:.0f} <= "
+            f"{SCALE_IN_REQUEST_THRESHOLD}."
         )
 
+    # --------------------------------------------------------
     # MAINTAIN
+    # --------------------------------------------------------
+
+    if requests is None:
+        request_text = "No RequestCount data"
+    else:
+        request_text = f"RequestCount={requests:.0f}"
+
     return (
         "MAINTAIN_CAPACITY",
-        f"Fleet CPU {fleet_cpu:.2f}% is inside the "
-        f"{SCALE_IN_THRESHOLD:.2f}% - "
-        f"{SCALE_OUT_THRESHOLD:.2f}% stability range."
+        f"No scaling condition met. "
+        f"Fleet CPU={fleet_cpu:.2f}%, "
+        f"Max CPU={max_cpu:.2f}%, "
+        f"{request_text}."
     )
 
 
@@ -198,10 +334,10 @@ def decide_capacity(instance_count, fleet_cpu):
 
 def main():
 
-    print("=" * 60)
+    print("=" * 65)
     print("CUSTOM AUTO SCALING CONTROLLER")
     print("MODE: DRY RUN")
-    print("=" * 60)
+    print("=" * 65)
 
     timestamp = datetime.now(timezone.utc)
 
@@ -210,9 +346,9 @@ def main():
         f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # OBSERVE
-    # --------------------------------------------------------
+    # ========================================================
 
     print("\n[OBSERVE]")
 
@@ -226,6 +362,7 @@ def main():
     )
 
     print(f"Running instances: {instance_count}")
+
     print(
         f"Allowed capacity: "
         f"{MIN_INSTANCES}-{MAX_INSTANCES}"
@@ -242,6 +379,7 @@ def main():
         print(f"  ID:         {instance['id']}")
         print(f"  Type:       {instance['type']}")
         print(f"  Private IP: {instance['private_ip']}")
+        print(f"  Protected:  {instance['protected']}")
 
         if cpu is None:
             print("  CPU:        No data")
@@ -250,44 +388,94 @@ def main():
             print(f"  CPU:        {cpu:.2f}%")
             cpu_values.append(cpu)
 
-    # --------------------------------------------------------
-    # ANALYZE
-    # --------------------------------------------------------
+    request_count = get_request_count()
 
-    print("\n" + "-" * 60)
+    print("\nApplication Load Balancer:")
+
+    if request_count is None:
+        print("  RequestCount (5 min): No data")
+    else:
+        print(
+            f"  RequestCount (5 min): "
+            f"{request_count:.0f}"
+        )
+
+    # ========================================================
+    # ANALYZE
+    # ========================================================
+
+    print("\n" + "-" * 65)
     print("[ANALYZE]")
 
-    fleet_cpu = calculate_fleet_cpu(cpu_values)
+    metrics = analyze_metrics(
+        cpu_values,
+        request_count
+    )
+
+    fleet_cpu = metrics["fleet_cpu_avg"]
+    max_cpu = metrics["max_instance_cpu"]
 
     if fleet_cpu is None:
         print("Fleet average CPU: No data")
-
     else:
         print(
             f"Fleet average CPU: "
             f"{fleet_cpu:.2f}%"
         )
 
+    if max_cpu is None:
+        print("Maximum instance CPU: No data")
+    else:
+        print(
+            f"Maximum instance CPU: "
+            f"{max_cpu:.2f}%"
+        )
+
+    if request_count is None:
+        print("ALB RequestCount: No data")
+    else:
+        print(
+            f"ALB RequestCount (5 min): "
+            f"{request_count:.0f}"
+        )
+
+    print("\nThresholds:")
+
     print(
-        f"Scale-in threshold:  "
-        f"{SCALE_IN_THRESHOLD:.2f}%"
+        f"  Scale-in CPU:       "
+        f"<= {SCALE_IN_CPU_THRESHOLD:.2f}%"
     )
 
     print(
-        f"Scale-out threshold: "
-        f"{SCALE_OUT_THRESHOLD:.2f}%"
+        f"  Scale-out CPU:      "
+        f">= {SCALE_OUT_CPU_THRESHOLD:.2f}%"
     )
 
-    # --------------------------------------------------------
+    print(
+        f"  High instance CPU:  "
+        f">= {HIGH_INSTANCE_CPU_THRESHOLD:.2f}%"
+    )
+
+    print(
+        f"  Scale-in requests:  "
+        f"<= {SCALE_IN_REQUEST_THRESHOLD}"
+    )
+
+    print(
+        f"  Scale-out requests: "
+        f">= {SCALE_OUT_REQUEST_THRESHOLD}"
+    )
+
+    # ========================================================
     # DECIDE
-    # --------------------------------------------------------
+    # ========================================================
 
-    print("\n" + "-" * 60)
+    print("\n" + "-" * 65)
     print("[DECIDE]")
 
     decision, reason = decide_capacity(
         instance_count,
-        fleet_cpu
+        metrics
     )
 
     print(f"Decision: {decision}")
@@ -295,39 +483,63 @@ def main():
 
     print(
         f"Capacity: {instance_count} "
-        f"(min={MIN_INSTANCES}, max={MAX_INSTANCES})"
+        f"(min={MIN_INSTANCES}, "
+        f"max={MAX_INSTANCES})"
     )
 
-    # --------------------------------------------------------
-    # ACT
-    # --------------------------------------------------------
+    # ========================================================
+    # ACT - DISABLED
+    # ========================================================
 
-    print("\n" + "-" * 60)
+    print("\n" + "-" * 65)
     print("[ACT]")
 
-    print("DRY RUN - No AWS resources were modified.")
+    print(
+        "DRY RUN - No AWS resources were modified."
+    )
 
     if decision == "INCREASE_CAPACITY":
+
         print(
             "Simulated action: "
-            "Launch one additional EC2 instance."
+            "Launch one additional managed EC2 instance."
         )
 
     elif decision == "REDUCE_CAPACITY":
-        print(
-            "Simulated action: "
-            "Remove one managed EC2 instance."
-        )
+
+        removable_instances = [
+            instance
+            for instance in instances
+            if not instance["protected"]
+        ]
+
+        if removable_instances:
+
+            candidate = removable_instances[0]
+
+            print(
+                "Simulated action: "
+                f"Remove {candidate['name']} "
+                f"({candidate['id']})."
+            )
+
+        else:
+
+            print(
+                "Simulated action cancelled: "
+                "No unprotected instance available."
+            )
 
     else:
+
         print(
             "Simulated action: "
             "Keep current capacity."
         )
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 65)
     print("CONTROLLER EXECUTION COMPLETED")
-    print("=" * 60)
+    print("=" * 65)
 
 
 # ============================================================
