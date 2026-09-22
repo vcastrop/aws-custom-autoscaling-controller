@@ -5,8 +5,8 @@ import boto3
 
 class MetricsCollector:
     """
-    Collects the metrics and infrastructure state required
-    by the custom auto-scaling controller.
+    Collect all AWS observations required by the custom
+    auto-scaling controller.
 
     Decision metrics:
     - Average fleet CPU
@@ -65,16 +65,21 @@ class MetricsCollector:
                     for tag in instance.get("Tags", [])
                 }
 
+                protected = (
+                    tags.get("Protected", "false").lower() == "true"
+                )
+
                 instances.append(
                     {
                         "instance_id": instance["InstanceId"],
                         "launch_time": instance["LaunchTime"],
-                        "protected": (
-                            tags.get("Protected", "false").lower()
-                            == "true"
-                        ),
+                        "protected": protected,
                     }
                 )
+
+        instances.sort(
+            key=lambda instance: instance["launch_time"]
+        )
 
         return instances
 
@@ -126,6 +131,10 @@ class MetricsCollector:
     # ---------------------------------------------------------
 
     def get_instance_cpu(self, instance_id):
+        """
+        Return the latest average CPU utilization for one instance.
+        """
+
         return self._latest_metric(
             namespace="AWS/EC2",
             metric_name="CPUUtilization",
@@ -149,27 +158,27 @@ class MetricsCollector:
         for instance in instances:
             instance_id = instance["instance_id"]
 
-            per_instance[instance_id] = self.get_instance_cpu(
-                instance_id
-            )
+            cpu = self.get_instance_cpu(instance_id)
 
-        valid_values = [
-            value
-            for value in per_instance.values()
-            if value is not None
-        ]
+            if cpu is not None:
+                per_instance[instance_id] = cpu
 
-        if not valid_values:
+        if not per_instance:
             return {
-                "per_instance": per_instance,
+                "per_instance": {},
                 "average": None,
                 "maximum": None,
             }
 
+        values = list(per_instance.values())
+
+        average = sum(values) / len(values)
+        maximum = max(values)
+
         return {
             "per_instance": per_instance,
-            "average": sum(valid_values) / len(valid_values),
-            "maximum": max(valid_values),
+            "average": average,
+            "maximum": maximum,
         }
 
     # ---------------------------------------------------------
@@ -178,19 +187,49 @@ class MetricsCollector:
 
     def get_request_count(self):
         """
-        Return the latest ALB RequestCount.
+        Return the total ALB RequestCount observed during the
+        configured lookback window.
+
+        ALB RequestCount is published at 60-second granularity.
+        All 60-second buckets inside the observation window are
+        summed so that a recent zero bucket does not hide traffic
+        observed earlier in the window.
         """
 
-        return self._latest_metric(
-            namespace="AWS/ApplicationELB",
-            metric_name="RequestCount",
-            dimensions=[
+        lookback = self.config["timing"]["metric_lookback_seconds"]
+
+        # Application Load Balancer metrics are available at
+        # 60-second granularity.
+        period = 60
+
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(seconds=lookback)
+
+        response = self.cloudwatch.get_metric_statistics(
+            Namespace="AWS/ApplicationELB",
+            MetricName="RequestCount",
+            Dimensions=[
                 {
                     "Name": "LoadBalancer",
                     "Value": self.alb_dimension,
                 }
             ],
-            statistic="Sum",
+            StartTime=start,
+            EndTime=end,
+            Period=period,
+            Statistics=["Sum"],
+        )
+
+        datapoints = response.get("Datapoints", [])
+
+        if not datapoints:
+            return None
+
+        return float(
+            sum(
+                datapoint["Sum"]
+                for datapoint in datapoints
+            )
         )
 
     # ---------------------------------------------------------
@@ -229,32 +268,32 @@ class MetricsCollector:
         Collect one complete observation for the controller.
         """
 
+        timestamp = datetime.now(timezone.utc).isoformat()
+
         instances = self.get_running_instances()
+
         cpu = self.get_fleet_cpu(instances)
+
         request_count = self.get_request_count()
 
         targets = self.get_target_health()
 
-        healthy_targets = [
-            target
+        healthy_targets = sum(
+            1
             for target in targets
             if target["state"] == "healthy"
-        ]
+        )
 
         return {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-
+            "timestamp": timestamp,
             "capacity": {
                 "running": len(instances),
-                "healthy": len(healthy_targets),
+                "healthy": healthy_targets,
             },
-
             "instances": instances,
-
             "metrics": {
                 "cpu": cpu,
                 "request_count": request_count,
             },
-
             "targets": targets,
         }
