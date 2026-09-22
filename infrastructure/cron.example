@@ -1,0 +1,1 @@
+* * * * * /home/ec2-user/aws-custom-autoscaling-controller/scripts/run_controller.sh >> /var/log/autoscaling-controller.log 2>&1

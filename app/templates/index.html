@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>AWS Custom Auto-Scaling Demo</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f4f6f8;
+            margin: 0;
+            padding: 0;
+        }
+
+        .container {
+            max-width: 700px;
+            margin: 80px auto;
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }
+
+        h1 {
+            margin-top: 0;
+        }
+
+        .status {
+            color: green;
+            font-weight: bold;
+        }
+
+        .instance {
+            background: #f1f1f1;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: monospace;
+        }
+
+        code {
+            background: #f1f1f1;
+            padding: 3px 6px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>AWS Custom Auto-Scaling Demo</h1>
+
+    <p>
+        Web application used to evaluate a custom
+        elasticity controller running on AWS.
+    </p>
+
+    <h3>Application status</h3>
+
+    <p class="status">
+        HEALTHY
+    </p>
+
+    <h3>Serving instance</h3>
+
+    <div class="instance">
+        {{ instance_name }}
+    </div>
+
+    <h3>Experimental endpoints</h3>
+
+    <p>
+        Health check:
+        <code>/health</code>
+    </p>
+
+    <p>
+        Controlled CPU workload:
+        <code>/work?intensity=50000</code>
+    </p>
+
+</div>
+
+</body>
+</html>

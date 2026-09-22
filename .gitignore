@@ -1,1 +1,7 @@
 controller_state.json
+config/config.json
+logs/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

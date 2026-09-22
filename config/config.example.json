@@ -1,0 +1,40 @@
+{
+  "aws": {
+    "region": "us-east-1",
+    "launch_template_id": "lt-REPLACE_ME",
+    "launch_template_version": "$Latest",
+    "target_group_arn": "arn:aws:elasticloadbalancing:REGION:ACCOUNT_ID:targetgroup/REPLACE_ME/REPLACE_ME",
+    "alb_dimension": "app/REPLACE_ME/REPLACE_ME",
+    "subnet_ids": [
+      "subnet-REPLACE_ME"
+    ]
+  },
+
+  "capacity": {
+    "min_instances": 1,
+    "max_instances": 5,
+    "scale_step": 1
+  },
+
+  "thresholds": {
+    "cpu_scale_out": 60.0,
+    "cpu_scale_in": 20.0,
+    "cpu_individual_high": 80.0,
+    "requests_scale_out": 1000,
+    "requests_scale_in": 100
+  },
+
+  "timing": {
+    "controller_interval_seconds": 60,
+    "cooldown_seconds": 300,
+    "metric_period_seconds": 300,
+    "metric_lookback_seconds": 600,
+    "connection_draining_seconds": 30,
+    "target_health_timeout_seconds": 180
+  },
+
+  "tags": {
+    "Project": "CustomAutoScaling",
+    "ManagedBy": "CustomController"
+  }
+}
