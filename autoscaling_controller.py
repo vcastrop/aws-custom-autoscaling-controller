@@ -1,4 +1,5 @@
 import boto3
+import time
 from datetime import datetime, timedelta, timezone
 
 # ============================================================
@@ -9,6 +10,22 @@ REGION = "us-east-1"
 
 MIN_INSTANCES = 1
 MAX_INSTANCES = 5
+
+# ------------------------------------------------------------
+# REAL ACTIONS
+# ------------------------------------------------------------
+
+# False = no AWS resources are modified by the controller.
+# True  = real scale-out is allowed.
+ENABLE_REAL_ACTIONS = False
+
+# IMPORTANT:
+# Real scale-in remains disabled independently for safety.
+ENABLE_REAL_SCALE_IN = False
+
+# ------------------------------------------------------------
+# THRESHOLDS
+# ------------------------------------------------------------
 
 # Initial thresholds - will be validated experimentally
 SCALE_OUT_CPU_THRESHOLD = 60.0
@@ -22,11 +39,29 @@ HIGH_INSTANCE_CPU_THRESHOLD = 80.0
 SCALE_OUT_REQUEST_THRESHOLD = 1000
 SCALE_IN_REQUEST_THRESHOLD = 100
 
+# ------------------------------------------------------------
+# RESOURCE IDENTIFIERS
+# ------------------------------------------------------------
+
 PROJECT_TAG = "CustomAutoScaling"
 MANAGED_BY_TAG = "CustomController"
 
-# CloudWatch LoadBalancer dimension extracted from the ALB ARN
 ALB_DIMENSION = "app/autoscaling-web-alb/b93f8a5f93d870ab"
+
+LAUNCH_TEMPLATE_ID = "lt-089bd536e5ebf7f28"
+LAUNCH_TEMPLATE_VERSION = "2"
+
+TARGET_GROUP_ARN = (
+    "arn:aws:elasticloadbalancing:us-east-1:"
+    "929298073516:targetgroup/"
+    "autoscaling-web-tg/d0df5973794dd8a7"
+)
+
+# Subnets attached to the ALB.
+SUBNET_IDS = [
+    "subnet-0a3897d81e5072e76",  # us-east-1a
+    "subnet-00a75d68543daaa53",  # us-east-1d
+]
 
 
 # ============================================================
@@ -35,6 +70,7 @@ ALB_DIMENSION = "app/autoscaling-web-alb/b93f8a5f93d870ab"
 
 ec2 = boto3.client("ec2", region_name=REGION)
 cloudwatch = boto3.client("cloudwatch", region_name=REGION)
+elbv2 = boto3.client("elbv2", region_name=REGION)
 
 
 # ============================================================
@@ -175,11 +211,6 @@ def get_request_count():
 def analyze_metrics(cpu_values, request_count):
     """
     Calculates fleet-level metrics.
-
-    Returns:
-        fleet_cpu_avg
-        max_instance_cpu
-        request_count
     """
 
     if cpu_values:
@@ -202,9 +233,8 @@ def analyze_metrics(cpu_values, request_count):
 
 def decide_capacity(instance_count, metrics):
     """
-    Makes a scaling decision without modifying AWS resources.
+    Makes one of three explicit decisions:
 
-    Decisions:
         INCREASE_CAPACITY
         MAINTAIN_CAPACITY
         REDUCE_CAPACITY
@@ -290,8 +320,6 @@ def decide_capacity(instance_count, metrics):
         and requests <= SCALE_IN_REQUEST_THRESHOLD
     )
 
-    # Scale-in is intentionally more conservative.
-    # Both CPU and RequestCount must indicate low demand.
     if low_average_cpu and low_requests:
 
         if instance_count <= MIN_INSTANCES:
@@ -329,14 +357,258 @@ def decide_capacity(instance_count, metrics):
 
 
 # ============================================================
+# ACT - SCALE OUT
+# ============================================================
+
+def choose_subnet(instances):
+    """
+    Chooses between the two ALB subnets.
+
+    The selection alternates based on the current number of
+    managed instances so that repeated scale-outs do not always
+    use exactly the same subnet.
+    """
+
+    index = len(instances) % len(SUBNET_IDS)
+    return SUBNET_IDS[index]
+
+
+def scale_out(instances):
+    """
+    Creates one EC2 instance from the Launch Template,
+    waits until it is running, registers it in the Target Group,
+    and waits until the ALB reports it as healthy.
+
+    Returns the new instance ID and elapsed time.
+    """
+
+    current_count = len(instances)
+
+    if current_count >= MAX_INSTANCES:
+        print(
+            "Scale-out cancelled: maximum capacity "
+            f"{MAX_INSTANCES} already reached."
+        )
+        return None
+
+    subnet_id = choose_subnet(instances)
+
+    print("REAL ACTION: SCALE OUT")
+    print(f"Current capacity: {current_count}")
+    print(f"Target capacity:  {current_count + 1}")
+    print(f"Launch Template:  {LAUNCH_TEMPLATE_ID}")
+    print(f"Template version: {LAUNCH_TEMPLATE_VERSION}")
+    print(f"Subnet:           {subnet_id}")
+
+    start_time = time.monotonic()
+
+    # --------------------------------------------------------
+    # CREATE INSTANCE
+    # --------------------------------------------------------
+
+    print("\nLaunching new EC2 instance...")
+
+    response = ec2.run_instances(
+        LaunchTemplate={
+            "LaunchTemplateId": LAUNCH_TEMPLATE_ID,
+            "Version": LAUNCH_TEMPLATE_VERSION
+        },
+        SubnetId=subnet_id,
+        MinCount=1,
+        MaxCount=1
+    )
+
+    instance_id = response["Instances"][0]["InstanceId"]
+
+    print(f"Created instance: {instance_id}")
+    print("Waiting for EC2 state = running...")
+
+    # --------------------------------------------------------
+    # WAIT FOR RUNNING
+    # --------------------------------------------------------
+
+    running_waiter = ec2.get_waiter("instance_running")
+
+    running_waiter.wait(
+        InstanceIds=[instance_id],
+        WaiterConfig={
+            "Delay": 10,
+            "MaxAttempts": 30
+        }
+    )
+
+    print(f"Instance {instance_id} is running.")
+
+    # --------------------------------------------------------
+    # REGISTER IN TARGET GROUP
+    # --------------------------------------------------------
+
+    print("Registering instance in Target Group...")
+
+    elbv2.register_targets(
+        TargetGroupArn=TARGET_GROUP_ARN,
+        Targets=[
+            {
+                "Id": instance_id,
+                "Port": 80
+            }
+        ]
+    )
+
+    print("Target registered.")
+    print("Waiting for ALB target state = healthy...")
+
+    # --------------------------------------------------------
+    # WAIT FOR HEALTHY
+    # --------------------------------------------------------
+
+    healthy_waiter = elbv2.get_waiter(
+        "target_in_service"
+    )
+
+    healthy_waiter.wait(
+        TargetGroupArn=TARGET_GROUP_ARN,
+        Targets=[
+            {
+                "Id": instance_id,
+                "Port": 80
+            }
+        ],
+        WaiterConfig={
+            "Delay": 15,
+            "MaxAttempts": 40
+        }
+    )
+
+    elapsed = time.monotonic() - start_time
+
+    print(
+        f"Instance {instance_id} is HEALTHY "
+        "in the Target Group."
+    )
+
+    print(
+        f"Scale-out completed in "
+        f"{elapsed:.2f} seconds."
+    )
+
+    print(
+        f"New capacity: {current_count + 1}"
+    )
+
+    return {
+        "instance_id": instance_id,
+        "elapsed_seconds": elapsed
+    }
+
+
+# ============================================================
+# ACT
+# ============================================================
+
+def act(decision, instances):
+
+    if decision == "INCREASE_CAPACITY":
+
+        if not ENABLE_REAL_ACTIONS:
+
+            print(
+                "DRY RUN - Real AWS actions are disabled."
+            )
+
+            print(
+                "Simulated action: "
+                "Launch one additional managed EC2 instance."
+            )
+
+            return
+
+        try:
+            scale_out(instances)
+
+        except Exception as error:
+
+            print("ERROR DURING SCALE OUT")
+            print(f"{type(error).__name__}: {error}")
+
+            print(
+                "Controller stopped the scaling action "
+                "instead of attempting additional changes."
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # SCALE IN
+    # --------------------------------------------------------
+
+    if decision == "REDUCE_CAPACITY":
+
+        removable_instances = [
+            instance
+            for instance in instances
+            if not instance["protected"]
+        ]
+
+        if not removable_instances:
+
+            print(
+                "Scale-in cancelled: "
+                "No unprotected instance available."
+            )
+            return
+
+        candidate = removable_instances[0]
+
+        # Scale-in remains intentionally disabled for now.
+        if not ENABLE_REAL_SCALE_IN:
+
+            print(
+                "SCALE-IN SAFETY MODE - "
+                "Real termination is disabled."
+            )
+
+            print(
+                "Simulated action: "
+                f"Remove {candidate['name']} "
+                f"({candidate['id']})."
+            )
+
+            return
+
+        # We intentionally do NOT implement termination here yet.
+        print(
+            "Real scale-in has not been enabled "
+            "in this controller version."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # MAINTAIN
+    # --------------------------------------------------------
+
+    print(
+        "No infrastructure change required. "
+        "Keeping current capacity."
+    )
+
+
+# ============================================================
 # MAIN CONTROLLER
 # ============================================================
 
 def main():
 
+    mode = (
+        "REAL SCALE-OUT ENABLED"
+        if ENABLE_REAL_ACTIONS
+        else "DRY RUN"
+    )
+
     print("=" * 65)
     print("CUSTOM AUTO SCALING CONTROLLER")
-    print("MODE: DRY RUN")
+    print(f"MODE: {mode}")
     print("=" * 65)
 
     timestamp = datetime.now(timezone.utc)
@@ -352,7 +624,17 @@ def main():
 
     print("\n[OBSERVE]")
 
-    instances = get_running_instances()
+    try:
+        instances = get_running_instances()
+    except Exception as error:
+        print(
+            f"ERROR discovering EC2 instances: {error}"
+        )
+        print(
+            "Safe fallback: no scaling action performed."
+        )
+        return
+
     instance_count = len(instances)
 
     print(
@@ -372,7 +654,14 @@ def main():
 
     for instance in instances:
 
-        cpu = get_cpu(instance["id"])
+        try:
+            cpu = get_cpu(instance["id"])
+        except Exception as error:
+            print(
+                f"\nCloudWatch error for "
+                f"{instance['id']}: {error}"
+            )
+            cpu = None
 
         print("\nInstance:")
         print(f"  Name:       {instance['name']}")
@@ -383,12 +672,17 @@ def main():
 
         if cpu is None:
             print("  CPU:        No data")
-
         else:
             print(f"  CPU:        {cpu:.2f}%")
             cpu_values.append(cpu)
 
-    request_count = get_request_count()
+    try:
+        request_count = get_request_count()
+    except Exception as error:
+        print(
+            f"\nCloudWatch ALB error: {error}"
+        )
+        request_count = None
 
     print("\nApplication Load Balancer:")
 
@@ -488,54 +782,16 @@ def main():
     )
 
     # ========================================================
-    # ACT - DISABLED
+    # ACT
     # ========================================================
 
     print("\n" + "-" * 65)
     print("[ACT]")
 
-    print(
-        "DRY RUN - No AWS resources were modified."
+    act(
+        decision,
+        instances
     )
-
-    if decision == "INCREASE_CAPACITY":
-
-        print(
-            "Simulated action: "
-            "Launch one additional managed EC2 instance."
-        )
-
-    elif decision == "REDUCE_CAPACITY":
-
-        removable_instances = [
-            instance
-            for instance in instances
-            if not instance["protected"]
-        ]
-
-        if removable_instances:
-
-            candidate = removable_instances[0]
-
-            print(
-                "Simulated action: "
-                f"Remove {candidate['name']} "
-                f"({candidate['id']})."
-            )
-
-        else:
-
-            print(
-                "Simulated action cancelled: "
-                "No unprotected instance available."
-            )
-
-    else:
-
-        print(
-            "Simulated action: "
-            "Keep current capacity."
-        )
 
     print("\n" + "=" * 65)
     print("CONTROLLER EXECUTION COMPLETED")
