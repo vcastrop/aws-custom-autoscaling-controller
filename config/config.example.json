@@ -6,7 +6,7 @@
     "target_group_arn": "arn:aws:elasticloadbalancing:REGION:ACCOUNT_ID:targetgroup/REPLACE_ME/REPLACE_ME",
     "alb_dimension": "app/REPLACE_ME/REPLACE_ME",
     "subnet_ids": [
-      "subnet-REPLACE_ME"
+      "subnet-REPLACE_WITH_ALB_ENABLED_SUBNET"
     ]
   },
 
