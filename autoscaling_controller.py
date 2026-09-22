@@ -17,7 +17,7 @@ MAX_INSTANCES = 5
 
 # False = no AWS resources are modified by the controller.
 # True  = real scale-out is allowed.
-ENABLE_REAL_ACTIONS = False
+ENABLE_REAL_ACTIONS = True
 
 # IMPORTANT:
 # Real scale-in remains disabled independently for safety.
@@ -36,7 +36,7 @@ HIGH_INSTANCE_CPU_THRESHOLD = 80.0
 
 # ALB request thresholds per 5-minute period.
 # Initial experimental values; not final.
-SCALE_OUT_REQUEST_THRESHOLD = 1000
+SCALE_OUT_REQUEST_THRESHOLD = 0
 SCALE_IN_REQUEST_THRESHOLD = 100
 
 # ------------------------------------------------------------
