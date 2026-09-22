@@ -30,7 +30,7 @@
     "metric_period_seconds": 300,
     "metric_lookback_seconds": 600,
     "connection_draining_seconds": 30,
-    "target_health_timeout_seconds": 180
+    "target_health_timeout_seconds": 300
   },
 
   "tags": {
