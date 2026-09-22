@@ -36,7 +36,7 @@ HIGH_INSTANCE_CPU_THRESHOLD = 80.0
 
 # ALB request thresholds per 5-minute period.
 # Initial experimental values; not final.
-SCALE_OUT_REQUEST_THRESHOLD = 0
+SCALE_OUT_REQUEST_THRESHOLD = 1000
 SCALE_IN_REQUEST_THRESHOLD = 100
 
 # ------------------------------------------------------------
@@ -456,36 +456,18 @@ def scale_out(instances):
     )
 
     print("Target registered.")
-    print("Waiting for ALB target state = healthy...")
 
-    # --------------------------------------------------------
-    # WAIT FOR HEALTHY
-    # --------------------------------------------------------
+    # AWS Academy explicitly denies DescribeTargetHealth.
+    # Therefore, the controller cannot use the target_in_service
+    # waiter. The target has been registered successfully and the
+    # ALB will perform its configured health checks independently.
 
-    healthy_waiter = elbv2.get_waiter(
-        "target_in_service"
-    )
-
-    healthy_waiter.wait(
-        TargetGroupArn=TARGET_GROUP_ARN,
-        Targets=[
-            {
-                "Id": instance_id,
-                "Port": 80
-            }
-        ],
-        WaiterConfig={
-            "Delay": 15,
-            "MaxAttempts": 40
-        }
+    print(
+        "Target registered successfully. "
+        "ALB health verification is handled asynchronously."
     )
 
     elapsed = time.monotonic() - start_time
-
-    print(
-        f"Instance {instance_id} is HEALTHY "
-        "in the Target Group."
-    )
 
     print(
         f"Scale-out completed in "
